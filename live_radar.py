@@ -51,7 +51,8 @@ class BoundingBox:
 
 
 # Default Radar Configuration Parameters
-DEFAULT_SENSOR_POSITION = [0, 0, 1, 0, 0]  # [x, y, z (height in m), azimuth_tilt (deg), elevation_tilt (deg)]
+DEFAULT_SENSOR_HEIGHT = 1.0  # Default sensor height above ground in meters (z value)
+DEFAULT_SENSOR_POSITION = [0, 0, DEFAULT_SENSOR_HEIGHT, 0, 0]  # [x, y, z (height in m), azimuth_tilt (deg), elevation_tilt (deg)]
 
 DEFAULT_BOUNDING_BOXES = {
     "boundaryBox": [-4, 4, 0, 7.5, -0.5, 3],          # [minX, maxX, minY, maxY, minZ, maxZ]
@@ -106,7 +107,7 @@ def format_param_value(val) -> str:
 
 def prepare_config_commands(
     config_file='object.cfg',
-    sensor_position=None,
+    sensor_height=None,
     boundary_box=None,
     static_boundary_box=None,
     presence_boundary_box=None,
@@ -120,8 +121,9 @@ def prepare_config_commands(
     with open(config_file, 'r') as f:
         lines = f.readlines()
 
-    # Determine effective sensor position
-    eff_sensor_pos = sensor_position if sensor_position is not None else DEFAULT_SENSOR_POSITION
+    # Determine effective sensor position (uses sensor_height for z, defaults for x, y, az, el)
+    eff_height = sensor_height if sensor_height is not None else DEFAULT_SENSOR_HEIGHT
+    eff_sensor_pos = [DEFAULT_SENSOR_POSITION[0], DEFAULT_SENSOR_POSITION[1], eff_height, DEFAULT_SENSOR_POSITION[3], DEFAULT_SENSOR_POSITION[4]]
 
     # Build dictionary of effective bounding boxes starting from defaults
     eff_boxes = dict(DEFAULT_BOUNDING_BOXES)
@@ -187,7 +189,7 @@ def prepare_config_commands(
 def send_config(
     cfg_port_name,
     config_file='object.cfg',
-    sensor_position=None,
+    sensor_height=None,
     boundary_box=None,
     static_boundary_box=None,
     presence_boundary_box=None,
@@ -214,7 +216,7 @@ def send_config(
 
         commands = prepare_config_commands(
             config_file=config_file,
-            sensor_position=sensor_position,
+            sensor_height=sensor_height,
             boundary_box=boundary_box,
             static_boundary_box=static_boundary_box,
             presence_boundary_box=presence_boundary_box,
@@ -245,13 +247,53 @@ def send_config(
         print("✅ Configuration sent successfully!\n")
     except serial.SerialException as e:
         print(f"❌ Error opening CFG port {cfg_port_name}: {e}")
-        find_serial_ports()
         sys.exit(1)
 
-def run_live_radar(data_port_name, baudrate, cfg_port_name=None):
-    classifier = KnightlyClassifier()
+def select_best_track(targets: list, metric: str = "persistence_confidence") -> dict | None:
+    """
+    Filters a list of tracks/targets to return the single track with the highest persistence/confidence.
+
+    :param targets: List of target dictionaries.
+    :param metric: 'persistence_confidence' (primary: persistence, secondary: confidence),
+                   'confidence' (primary: confidence, secondary: persistence),
+                   or 'persistence' (strictly persistence).
+    :return: The target dictionary with highest persistence/confidence, or None if targets is empty.
+    """
+    if not targets:
+        return None
+    if len(targets) == 1:
+        return targets[0]
+
+    if metric == "confidence":
+        return max(targets, key=lambda t: (t.get("confidence", 0.0), t.get("persistence", 0)))
+    elif metric == "persistence":
+        return max(targets, key=lambda t: (t.get("persistence", 0), t.get("confidence", 0.0)))
+    else:  # "persistence_confidence"
+        return max(targets, key=lambda t: (t.get("persistence", 0), t.get("confidence", 0.0)))
+
+
+def run_live_radar(
+    data_port_name,
+    baudrate,
+    cfg_port_name=None,
+    on_target=None,
+    filter_highest=True,
+    filter_metric="persistence_confidence",
+    sensor_height=DEFAULT_SENSOR_HEIGHT,
+    only_on_change=True,
+    bed_location=None,
+    **kwargs
+):
+    if "only_on_posture_change" in kwargs:
+        only_on_change = kwargs["only_on_posture_change"]
+
+    classifier = KnightlyClassifier(bed_location=bed_location)
+    eff_sensor_height = sensor_height if sensor_height is not None else DEFAULT_SENSOR_HEIGHT
     magic = b'\x02\x01\x04\x03\x06\x05\x08\x07'
     buffer = b''
+    track_persistence = {}
+    last_seen = {}
+    last_state = {}
     
     ports_to_try = [data_port_name]
     if cfg_port_name and cfg_port_name != data_port_name:
@@ -292,6 +334,7 @@ def run_live_radar(data_port_name, baudrate, cfg_port_name=None):
                                     buffer = buffer[plen:]
                                     
                                     offset = 40
+                                    frame_targets = []
                                     for i in range(numTLV):
                                         if offset + 8 > len(packet): break
                                         tlv_type, tlv_len = struct.unpack('<II', packet[offset:offset+8])
@@ -303,15 +346,81 @@ def run_live_radar(data_port_name, baudrate, cfg_port_name=None):
                                                 if t_off + 28 > len(packet): break
                                                 
                                                 tid, x, y, z, vx, vy, vz = struct.unpack('<Iffffff', packet[t_off:t_off+28])
+                                                if eff_sensor_height is not None:
+                                                    z += eff_sensor_height
                                                 velocity = math.sqrt(vx*vx + vy*vy + vz*vz)
                                                 
+                                                # Unpack confidenceLevel at offset 108 if 112-byte struct
+                                                confidence = 0.0
+                                                if t_off + 112 <= len(packet):
+                                                    confidence = struct.unpack('<f', packet[t_off+108:t_off+112])[0]
+                                                
+                                                # Track persistence (frame lifetime count)
+                                                persistence = track_persistence.get(tid, 0) + 1
+                                                track_persistence[tid] = persistence
+                                                last_seen[tid] = frameNum
+
                                                 classification = classifier.classify_target(x=x, y=y, z=z, velocity=velocity, vy=vy)
                                                 target_type = classification["type"]
                                                 posture = classification["posture"]
+                                                approaching_door = classification.get("approaching_door", False)
+                                                in_bed = classification.get("in_bed", False)
                                                 
-                                                print(f"[Frame {frameNum}] 🎯 Live Target [ID: {tid}] -> X: {x:5.2f}m | Y: {y:5.2f}m | Z: {z:5.2f}m | Speed: {velocity:5.2f}m/s | Type: {target_type} | Posture: {posture}")
+                                                target_dict = {
+                                                    "tid": tid,
+                                                    "x": x,
+                                                    "y": y,
+                                                    "z": z,
+                                                    "vx": vx,
+                                                    "vy": vy,
+                                                    "vz": vz,
+                                                    "velocity": velocity,
+                                                    "confidence": confidence,
+                                                    "persistence": persistence,
+                                                    "type": target_type,
+                                                    "posture": posture,
+                                                    "approaching_door": approaching_door,
+                                                    "in_bed": in_bed,
+                                                    "classification": classification,
+                                                }
+                                                frame_targets.append(target_dict)
                                                 
                                         offset += 8 + tlv_len
+
+                                    # Clean up stale tracks not seen in last 15 frames
+                                    for t_id in list(track_persistence.keys()):
+                                        if frameNum - last_seen.get(t_id, frameNum) > 15:
+                                            track_persistence.pop(t_id, None)
+                                            last_seen.pop(t_id, None)
+                                            last_state.pop(t_id, None)
+
+                                    if frame_targets:
+                                        if filter_highest:
+                                            best_tgt = select_best_track(frame_targets, metric=filter_metric)
+                                            selected_targets = [best_tgt] if best_tgt else []
+                                        else:
+                                            selected_targets = frame_targets
+
+                                        for tgt in selected_targets:
+                                            tid = tgt['tid']
+                                            posture = tgt['posture']
+                                            approaching_door = tgt['approaching_door']
+                                            current_state = (posture, approaching_door)
+                                            prev_state = last_state.get(tid)
+
+                                            if not only_on_change or current_state != prev_state:
+                                                last_state[tid] = current_state
+                                                bed_str = f" | In Bed: {tgt['in_bed']}" if bed_location is not None else ""
+                                                print(
+                                                    f"[Frame {frameNum}] 🎯 Live Target [ID: {tgt['tid']}] -> "
+                                                    f"X: {tgt['x']:5.2f}m | Y: {tgt['y']:5.2f}m | Z: {tgt['z']:5.2f}m | "
+                                                    f"Speed: {tgt['velocity']:5.2f}m/s | Type: {tgt['type']} | "
+                                                    f"Posture: {tgt['posture']} | Approaching Door: {tgt['approaching_door']}{bed_str} | "
+                                                    f"Persistence: {tgt['persistence']:2d} | "
+                                                    f"Conf: {tgt['confidence']:.2f}"
+                                                )
+                                            if on_target:
+                                                on_target(tgt)
                         
                         # Prevent buffer from growing infinitely if baud rate is wrong and magic is never found
                         if len(buffer) > 10000:
@@ -327,7 +436,6 @@ def run_live_radar(data_port_name, baudrate, cfg_port_name=None):
             if len(ports_to_try) > 1 and port != ports_to_try[-1]:
                 print(f"ℹ️ Trying {ports_to_try[-1]} instead...")
                 continue
-            find_serial_ports()
             return
 
 if __name__ == "__main__":
@@ -347,16 +455,20 @@ if __name__ == "__main__":
     parser.add_argument('--baud', type=int, default=1250000, help="Data port baud rate (default: 1250000)")
     
     # Parameterized Radar Options
-    parser.add_argument('--sensor-position', nargs='*', help="Sensor position: x y z az_tilt el_tilt (e.g. 0 0 1 0 0)")
+    parser.add_argument('--sensor-height', type=float, default=None, help="Sensor height above ground in meters (z value, e.g. 0.61)")
     parser.add_argument('--boundary-box', nargs='*', help="Main boundary box limits: minX maxX minY maxY minZ maxZ")
     parser.add_argument('--static-boundary-box', nargs='*', help="Static boundary box limits: minX maxX minY maxY minZ maxZ")
     parser.add_argument('--presence-boundary-box', nargs='*', help="Presence boundary box limits: minX maxX minY maxY minZ maxZ")
+    parser.add_argument('--bed-location', nargs='*', help="Bed bounding box limits: minX maxX minY maxY [minZ maxZ]")
+    parser.add_argument('--filter-metric', type=str, default='persistence_confidence', choices=['persistence_confidence', 'confidence', 'persistence'], help="Metric to rank tracks when multiple exist in a frame (default: persistence_confidence)")
+    parser.add_argument('--all-tracks', action='store_true', help="Output all tracks instead of filtering to the highest persistence/confidence track")
+    parser.add_argument('--print-all-frames', action='store_true', help="Print target details on every frame instead of only when posture or door approach changes")
     
     args = parser.parse_args()
 
     cfg_file = args.config
     has_custom_params = any([
-        args.sensor_position,
+        args.sensor_height is not None,
         args.boundary_box,
         args.static_boundary_box,
         args.presence_boundary_box,
@@ -365,15 +477,39 @@ if __name__ == "__main__":
         if os.path.exists("object.cfg"):
             cfg_file = "object.cfg"
 
+    effective_sensor_height = args.sensor_height if args.sensor_height is not None else DEFAULT_SENSOR_HEIGHT
+
+    bed_location = None
+    if args.bed_location:
+        raw_bed = []
+        for item in args.bed_location:
+            if isinstance(item, str):
+                raw_bed.extend(item.replace(',', ' ').split())
+            else:
+                raw_bed.append(item)
+        try:
+            bed_location = [float(v) for v in raw_bed]
+        except ValueError:
+            bed_location = raw_bed
+
     if cfg_file:
         send_config(
             args.cfg_port,
             config_file=cfg_file,
-            sensor_position=args.sensor_position,
+            sensor_height=args.sensor_height,
             boundary_box=args.boundary_box,
             static_boundary_box=args.static_boundary_box,
             presence_boundary_box=args.presence_boundary_box,
         )
         
-    run_live_radar(args.data_port, args.baud, args.cfg_port)
+    run_live_radar(
+        args.data_port,
+        args.baud,
+        args.cfg_port,
+        sensor_height=effective_sensor_height,
+        filter_highest=not args.all_tracks,
+        filter_metric=args.filter_metric,
+        only_on_change=not args.print_all_frames,
+        bed_location=bed_location,
+    )
 
