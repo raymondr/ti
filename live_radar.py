@@ -5,8 +5,7 @@ import math
 import sys
 import time
 import argparse
-
-
+import collections
 import os
 import re
 
@@ -282,6 +281,7 @@ def run_live_radar(
     sensor_height=DEFAULT_SENSOR_HEIGHT,
     only_on_change=True,
     bed_location=None,
+    window_size=3,
     **kwargs
 ):
     if "only_on_posture_change" in kwargs:
@@ -294,6 +294,7 @@ def run_live_radar(
     track_persistence = {}
     last_seen = {}
     last_state = {}
+    state_history = {}
     
     ports_to_try = [data_port_name]
     if cfg_port_name and cfg_port_name != data_port_name:
@@ -363,8 +364,6 @@ def run_live_radar(
                                                 classification = classifier.classify_target(x=x, y=y, z=z, velocity=velocity, vy=vy)
                                                 target_type = classification["type"]
                                                 posture = classification["posture"]
-                                                approaching_door = classification.get("approaching_door", False)
-                                                in_bed = classification.get("in_bed", False)
                                                 
                                                 target_dict = {
                                                     "tid": tid,
@@ -379,8 +378,6 @@ def run_live_radar(
                                                     "persistence": persistence,
                                                     "type": target_type,
                                                     "posture": posture,
-                                                    "approaching_door": approaching_door,
-                                                    "in_bed": in_bed,
                                                     "classification": classification,
                                                 }
                                                 frame_targets.append(target_dict)
@@ -393,6 +390,7 @@ def run_live_radar(
                                             track_persistence.pop(t_id, None)
                                             last_seen.pop(t_id, None)
                                             last_state.pop(t_id, None)
+                                            state_history.pop(t_id, None)
 
                                     if frame_targets:
                                         if filter_highest:
@@ -404,18 +402,34 @@ def run_live_radar(
                                         for tgt in selected_targets:
                                             tid = tgt['tid']
                                             posture = tgt['posture']
-                                            approaching_door = tgt['approaching_door']
-                                            current_state = (posture, approaching_door)
+                                            current_state = (posture)
+
+                                            eff_window = max(1, window_size)
+                                            if tid not in state_history:
+                                                state_history[tid] = collections.deque(maxlen=eff_window)
+                                            state_history[tid].append(current_state)
+
                                             prev_state = last_state.get(tid)
 
-                                            if not only_on_change or current_state != prev_state:
+                                            # Require state to be sustained over window_size frames before reporting change
+                                            is_sustained = (
+                                                len(state_history[tid]) >= eff_window
+                                                and all(s == current_state for s in state_history[tid])
+                                            )
+
+                                            should_print = False
+                                            if not only_on_change:
+                                                should_print = True
+                                            elif is_sustained and current_state != prev_state:
+                                                should_print = True
                                                 last_state[tid] = current_state
-                                                bed_str = f" | In Bed: {tgt['in_bed']}" if bed_location is not None else ""
+
+                                            if should_print:
                                                 print(
-                                                    f"[Frame {frameNum}] 🎯 Live Target [ID: {tgt['tid']}] -> "
+                                                    f"[Frame {frameNum}] Live Target [ID: {tgt['tid']}] -> "
                                                     f"X: {tgt['x']:5.2f}m | Y: {tgt['y']:5.2f}m | Z: {tgt['z']:5.2f}m | "
                                                     f"Speed: {tgt['velocity']:5.2f}m/s | Type: {tgt['type']} | "
-                                                    f"Posture: {tgt['posture']} | Approaching Door: {tgt['approaching_door']}{bed_str} | "
+                                                    f"Posture: {tgt['posture']} |"
                                                     f"Persistence: {tgt['persistence']:2d} | "
                                                     f"Conf: {tgt['confidence']:.2f}"
                                                 )
@@ -460,6 +474,7 @@ if __name__ == "__main__":
     parser.add_argument('--static-boundary-box', nargs='*', help="Static boundary box limits: minX maxX minY maxY minZ maxZ")
     parser.add_argument('--presence-boundary-box', nargs='*', help="Presence boundary box limits: minX maxX minY maxY minZ maxZ")
     parser.add_argument('--bed-location', nargs='*', help="Bed bounding box limits: minX maxX minY maxY [minZ maxZ]")
+    parser.add_argument('--window-size', type=int, default=3, help="Number of consecutive frames required for a sustained state before printing (default: 3)")
     parser.add_argument('--filter-metric', type=str, default='persistence_confidence', choices=['persistence_confidence', 'confidence', 'persistence'], help="Metric to rank tracks when multiple exist in a frame (default: persistence_confidence)")
     parser.add_argument('--all-tracks', action='store_true', help="Output all tracks instead of filtering to the highest persistence/confidence track")
     parser.add_argument('--print-all-frames', action='store_true', help="Print target details on every frame instead of only when posture or door approach changes")
@@ -511,5 +526,6 @@ if __name__ == "__main__":
         filter_metric=args.filter_metric,
         only_on_change=not args.print_all_frames,
         bed_location=bed_location,
+        window_size=args.window_size,
     )
 

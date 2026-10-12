@@ -18,12 +18,11 @@ class KnightlyClassifier:
                                             # Above 85cm is an adult
         
         # Velocity thresholds for Posture
-        self.threshold_walking_min_v = 0.50 # >0.5m/s indicates active traversal
+        self.threshold_walking_min_v = 0.5 # >0.5m/s indicates active traversal
         
         # Z-Height thresholds for Posture when Stationary (Velocity < 0.5 m/s)
         self.threshold_laying_max_z = 0.40  # Roughly mattress height
-        self.threshold_sitting_min_z = 0.45 # Roughly chair/edge-of-bed height
-        self.threshold_sitting_max_z = 0.80 # Upper limit for a seated child
+        self.threshold_bed_max_z = 0.80     # Upper Z height limit for laying in bed
         
         self.bed_location = bed_location
 
@@ -130,16 +129,8 @@ class KnightlyClassifier:
         :return: Dictionary containing the classified type, posture, approaching_door, and in_bed status
         """
         
-        # ==========================================
-        # 1. CLASSIFY TARGET TYPE (Adult/Child/Dog)
-        # ==========================================
-        if z <= self.threshold_dog_max_z:
-            target_type = "DOG"
-        elif z <= self.threshold_child_max_z:
-            target_type = "CHILD"
-        else:
-            target_type = "ADULT"
-            
+
+        target_type = None
         # ==========================================
         # 2. CLASSIFY POSTURE (Walking/Sitting/Laying)
         # ==========================================
@@ -149,44 +140,47 @@ class KnightlyClassifier:
         if velocity >= self.threshold_walking_min_v:
             # Target is actively moving
             posture = "WALKING"
+            # ==========================================
+            # 1. CLASSIFY TARGET TYPE (Adult/Child/Dog)
+            # ==========================================
+            if z <= self.threshold_dog_max_z:
+                target_type = "DOG"
+            elif z <= self.threshold_child_max_z:
+                target_type = "CHILD"
+            else:
+                target_type = "ADULT"
         else:
             # Target is stationary (Velocity < threshold_walking_min_v)
             if active_bed is not None:
                 if in_bed:
                     # Stationary inside bed area -> LAYING (unless standing tall on bed)
                     bounds = self.parse_bed_bounds(active_bed)
-                    max_bed_z = bounds[5] if (bounds and bounds[5] is not None) else self.threshold_sitting_max_z
+                    max_bed_z = bounds[5] if (bounds and bounds[5] is not None) else self.threshold_bed_max_z
                     if z <= max_bed_z:
                         posture = "LAYING"
                     else:
-                        posture = "STANDING"
+                        posture = "UPRIGHT"
                 else:
-                    # Stationary outside bed area -> SITTING or STANDING (not LAYING)
-                    if z <= self.threshold_sitting_max_z:
-                        posture = "SITTING"
-                    else:
-                        posture = "STANDING"
+                   posture = "UPRIGHT"
             else:
                 # Default heuristic when no bed location is configured
                 if z <= self.threshold_laying_max_z:
                     posture = "LAYING"
-                elif self.threshold_sitting_min_z <= z <= self.threshold_sitting_max_z:
-                    posture = "SITTING"
                 else:
-                    posture = "STANDING"
+                    posture = "UPRIGHT"
                 
         # ==========================================
         # 3. DOOR APPROACH LOGIC
         # ==========================================
         # Assuming the sensor is mounted on the door at Y=0.
         # If the target is getting close (Y < 1.0m) while moving towards the door (vy < 0)
-        is_approaching_door = bool(y < 1.0 and vy < -0.05)
+        is_approaching_door = bool(y < .7 and vy < -0.1)
+        if is_approaching_door:
+            posture = "APPROACHING_DOOR"
 
         return {
             "type": target_type,
             "posture": posture,
-            "approaching_door": is_approaching_door,
-            "in_bed": in_bed
         }
 
 # --- Example Usage ---
